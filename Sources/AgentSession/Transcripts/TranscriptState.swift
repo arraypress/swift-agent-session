@@ -15,13 +15,9 @@ import Foundation
 /// counted, so a re-read after an append never double counts.
 struct TranscriptState {
 
-    /// The dialect this state folds. Set once when the state is created.
-    let format: TranscriptFormat
-
-    /// - Parameter format: The agent dialect (default Claude Code). Explicit rather than
-    ///   memberwise, because the private accumulators below would make a synthesised init
-    ///   private and unreachable from the cache.
-    init(format: TranscriptFormat = .claude) { self.format = format }
+    /// Explicit rather than memberwise, because the private accumulators below would make a
+    /// synthesised init private and unreachable from the cache.
+    init() {}
 
 
     // MARK: - Usage accumulators
@@ -61,16 +57,6 @@ struct TranscriptState {
     /// Absolute paths of every file an edit tool wrote to.
     private var edited = Set<String>()
 
-    /// The model's context window, as Codex states it. Zero until a token_count arrives.
-    private var codexContextLimit = 0
-
-    /// The immediately-previous Codex row, so one message arriving through both of Codex's
-    /// channels isn't counted twice. Cleared by any other appended row, so the suppression is
-    /// strictly ADJACENT — a prompt genuinely repeated later ("continue", "yes") must still open
-    /// its own turn.
-    private var lastCodexUserText: String?
-    private var lastCodexAssistantText: String?
-
     /// The most recent `TodoWrite` list, as `(text, status)` pairs (last wins).
     private var todos: [(String, String)] = []
 
@@ -83,163 +69,9 @@ struct TranscriptState {
     /// (usage / events / summary) are updated from the single parse.
     mutating func ingest(lineData: Data) {
         guard let obj = JSONFile.object(from: lineData) else { return }
-        switch format {
-        case .claude:
-            ingestUsage(obj)
-            ingestEvent(obj)
-            ingestSummary(obj)
-        case .codex:
-            ingestCodex(obj)
-        }
-    }
-
-    /// Folds one Codex rollout line.
-    ///
-    /// A line is `{"timestamp":…, "type":<tag>, "payload":{…}}` — Rust's
-    /// `#[serde(tag = "type", content = "payload")]`. Only `response_item` carries conversation
-    /// content, and its payload is itself internally tagged, so the shape is a tag inside a tag.
-    private mutating func ingestCodex(_ obj: [String: Any]) {
-        guard let payload = obj["payload"] as? [String: Any] else { return }
-        let ts = Self.shortTime(obj["timestamp"] as? String)
-        switch obj["type"] as? String {
-        case "event_msg":      ingestCodexEvent(payload, ts)
-        case "response_item":  ingestCodexResponseItem(payload, ts)
-        default:               break
-        }
-    }
-
-    /// `event_msg`: user_message / agent_message carry text directly (Codex's own recorder
-    /// tests write a prompt this way — ignoring it meant zero turns), and `token_count` is
-    /// the one place Codex reports usage and the model's context window.
-    private mutating func ingestCodexEvent(_ payload: [String: Any], _ ts: String) {
-        if payload["type"] as? String == "token_count" {
-            ingestCodexTokens(payload["info"] as? [String: Any])
-            return
-        }
-        guard let message = payload["message"] as? String, !message.trimmed.isEmpty else { return }
-        switch payload["type"] as? String {
-        case "user_message":  appendCodexUser(message, ts)
-        case "agent_message": appendCodexAssistant(message, ts)
-        default:              break
-        }
-    }
-
-    /// `response_item`: an internally tagged payload — a message, a tool call, or a shell call.
-    private mutating func ingestCodexResponseItem(_ payload: [String: Any], _ ts: String) {
-        switch payload["type"] as? String {
-        case "message":
-            let text = Self.codexMessageText(payload)
-            guard !text.isEmpty else { return }
-            switch payload["role"] as? String {
-            case "user":      appendCodexUser(text, ts)
-            case "assistant": appendCodexAssistant(text, ts)
-            default:          break
-            }
-        case "function_call", "custom_tool_call":
-            forgetAdjacentCodexText()   // a tool call between two identical prompts means they are not adjacent
-            let name = payload["name"] as? String ?? "tool"
-            // Arguments are a JSON *string*, not an object — the model's raw tool call.
-            let raw = (payload["arguments"] as? String) ?? (payload["input"] as? String) ?? ""
-            let path = Self.codexEditedPath(tool: name, arguments: raw)
-            append(TimelineEvent(kind: path == nil ? .toolUse : .fileEdit, title: name,
-                                 detail: path ?? Self.firstLine(raw), filePath: path, timestamp: ts))
-            if let path { edited.insert(path) }
-        case "local_shell_call":
-            forgetAdjacentCodexText()
-            append(TimelineEvent(kind: .toolUse, title: "shell", detail: Self.firstLine(Self.codexShellCommand(payload)),
-                                 filePath: nil, timestamp: ts))
-        default:
-            break   // reasoning, *_output, web_search_call, compaction… — no timeline row
-        }
-    }
-
-    /// The user's text arrives as `input_text` parts and the model's as `output_text`; both
-    /// are collected rather than assuming one.
-    private static func codexMessageText(_ payload: [String: Any]) -> String {
-        (payload["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }.joined(separator: " ")
-    }
-
-    /// The shell action's argv as one line, or "shell".
-    private static func codexShellCommand(_ payload: [String: Any]) -> String {
-        let action = payload["action"] as? [String: Any] ?? [:]
-        return (action["command"] as? [String])?.joined(separator: " ") ?? (action["command"] as? String) ?? "shell"
-    }
-
-    private mutating func forgetAdjacentCodexText() {
-        lastCodexUserText = nil
-        lastCodexAssistantText = nil
-    }
-
-    /// Folds a Codex `token_count` payload into the usage accumulators.
-    ///
-    /// `last_token_usage` is the most recent request, which is the context-window fill;
-    /// `total_token_usage` accumulates across the session. `model_context_window` is stated
-    /// outright — Claude's has to be inferred from the largest context seen.
-    private mutating func ingestCodexTokens(_ info: [String: Any]?) {
-        guard let info else { return }
-        if let window = info["model_context_window"] as? Int, window > 0 { codexContextLimit = window }
-        if let last = info["last_token_usage"] as? [String: Any] {
-            let total = last["total_tokens"] as? Int
-                ?? ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens"]
-                    .compactMap { last[$0] as? Int }.reduce(0, +)
-            if total > 0 { curCtx = total; maxCtx = max(maxCtx, total) }
-        }
-        if let all = info["total_token_usage"] as? [String: Any],
-           let out = all["output_tokens"] as? Int { totalOut = out }
-    }
-
-    /// Appends a Codex user prompt, skipping an immediate duplicate.
-    ///
-    /// A session can record the same prompt through both channels (a `response_item` message and
-    /// an `event_msg`), so the identical text arriving twice in a row is one prompt seen twice —
-    /// not two — and would otherwise split one turn into two empty ones.
-    private mutating func appendCodexUser(_ text: String, _ ts: String) {
-        // Compare the FULL text, not firstLine: two different prompts sharing a first line
-        // ("Fix this:\n<code A>" / "Fix this:\n<code B>") are two prompts, not one.
-        guard text != lastCodexUserText else { return }
-        append(TimelineEvent(kind: .userPrompt, title: "You", detail: Self.firstLine(text),
-                             filePath: nil, timestamp: ts))
-        lastCodexUserText = text
-        lastCodexAssistantText = nil
-    }
-
-    /// Appends Codex assistant prose, skipping an immediate duplicate (same reason as above).
-    private mutating func appendCodexAssistant(_ text: String, _ ts: String) {
-        guard text != lastCodexAssistantText else { return }
-        append(TimelineEvent(kind: .assistantText, title: "Codex", detail: Self.firstLine(text),
-                             filePath: nil, timestamp: ts))
-        lastCodexAssistantText = text
-        lastCodexUserText = nil
-    }
-
-    /// The file a Codex tool call wrote to, or `nil` when the call isn't an edit.
-    ///
-    /// Codex edits arrive either as a JSON argument object carrying a path, or as an
-    /// `apply_patch` envelope whose paths are in the patch body (`*** Update File: <path>`).
-    /// Both are handled; anything else is treated as a non-edit tool rather than guessed at.
-    static func codexEditedPath(tool: String, arguments: String) -> String? {
-        if let data = arguments.data(using: .utf8),
-           let object = JSONFile.object(from: data) {
-            for key in ["file_path", "path", "filename", "file"] {
-                if let value = object[key] as? String, !value.isEmpty { return value }
-            }
-            // apply_patch nests the patch text under `input`/`patch`.
-            for key in ["input", "patch"] {
-                if let body = object[key] as? String, let path = applyPatchPath(body) { return path }
-            }
-        }
-        return applyPatchPath(arguments)
-    }
-
-    /// The first path named by an `apply_patch` envelope.
-    private static func applyPatchPath(_ patch: String) -> String? {
-        for line in patch.split(separator: "\n") {
-            for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
-            where line.hasPrefix(marker) {
-                return String(line.dropFirst(marker.count)).trimmingCharacters(in: .whitespaces)
-            }
-        }
-        return nil
+        ingestUsage(obj)
+        ingestEvent(obj)
+        ingestSummary(obj)
     }
 
     /// Updates the token/cost accumulators from one parsed line.
@@ -333,8 +165,8 @@ struct TranscriptState {
     /// transcript carries no usage records at all.
     var usageResult: AgentUsage? {
         guard maxCtx > 0 else { return nil }
-        // Codex publishes the window; Claude's is inferred from the largest context observed.
-        let limit = codexContextLimit > 0 ? codexContextLimit : (maxCtx > 200_000 ? 1_000_000 : 200_000)
+        // Claude does not publish the window, so it is inferred from the largest context observed.
+        let limit = maxCtx > 200_000 ? 1_000_000 : 200_000
         return AgentUsage(contextTokens: curCtx, contextLimit: limit, outputTokens: totalOut, costUSD: cost)
     }
 

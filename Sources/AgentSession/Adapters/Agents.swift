@@ -17,13 +17,18 @@ import Foundation
 public enum Agents {
 
     /// Every adapter known to the library, in detection order.
+    ///
+    /// **Claude Code only, deliberately (11 Sep 2026).** Adapters for Codex CLI, Gemini CLI and
+    /// OpenCode were written from each tool's published schema and tested against fixtures typed
+    /// out by hand from that schema — never against a real session of the tool they claimed to
+    /// read, because none of them was installed. Three separate integrations drifted silently in
+    /// one afternoon (a renamed Claude tool, a moved binary path in every installed hook entry,
+    /// and the Skills catalog before them), so an adapter nobody can run is a guess that reports
+    /// "no session" forever and tells no one. Recover them with
+    /// `git log --all -- Sources/AgentSession/Adapters`. Adding an agent back is still a one-line
+    /// change here — but only bring one back with fixtures captured from a REAL run of it.
     public static let all: [AgentAdapter] = [
         ClaudeCodeAdapter(),
-        CodexAdapter(),
-        OpenCodeAdapter(),
-        GeminiAdapter(),
-        // AiderAdapter(), GooseAdapter(), CrushAdapter() — add when their formats are read from
-        // source the way these were. Cursor is closed-source, so it can only ever be guessed at.
     ]
 
     /// The first adapter that has a session for `root` (first match wins), or

@@ -52,12 +52,6 @@ import Glibc
 ///   was not valid UTF-8 — JSONL is UTF-8 by spec, so this never mattered).
 final class TranscriptCache: @unchecked Sendable {
 
-    /// The transcript dialect this cache folds — see ``TranscriptFormat``.
-    private let format: TranscriptFormat
-
-    /// - Parameter format: The agent dialect (default Claude Code).
-    init(format: TranscriptFormat = .claude) { self.format = format }
-
 
     /// The results one poll serves — all three readers' values, materialized
     /// once per parse so usage/events/summary always come from the same bytes.
@@ -134,7 +128,7 @@ final class TranscriptCache: @unchecked Sendable {
 
         var entry = entries[key].flatMap { $0.isPureAppend(file.path, stat) ? $0 : nil }
             ?? Entry(filePath: file.path, inode: stat.inode, mtime: stat.mtime, size: 0, offset: 0,
-                     durable: TranscriptState(format: format), snapshot: .empty)
+                     durable: TranscriptState(), snapshot: .empty)
         // Read exactly [offset, size): the appended bytes plus the prefix of an unterminated line
         // carried over from the previous poll. Bytes appended after our stat wait for the next poll.
         guard let appended = readAppended(path: file.path, entry: entry, size: stat.size) else {
